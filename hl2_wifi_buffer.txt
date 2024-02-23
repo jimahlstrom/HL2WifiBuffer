@@ -1,0 +1,15 @@
+# This is the configuration file for the N2ADR Hermes-Lite2 WiFi buffer program.
+# Enter your values below. Lines starting with "#" are comments and are ignored.
+
+# This is the name of the interface connected to the HL2. Examples are "eth0" or "eth1".
+# Leave blank and the software will search for it. Only enter it if the search fails.
+#hl2_interface = eth0
+
+# This is the name of the WiFi interface. An example is "wlan0" or "wlan1".
+# Leave blank and the software will search for it. Only enter it if the search fails.
+#wifi_interface = wlan0
+
+# This is the delay in milliseconds in the Tx samples buffer.
+# The delay can be 20 to 1000 milliseconds. The default is 300.
+# If the delay is zero, the buffer is not used and packets are just copied.
+#buffer_milliseconds = 250

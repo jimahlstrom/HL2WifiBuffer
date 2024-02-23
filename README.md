@@ -108,8 +108,8 @@ To install the HL2 adapter software, clone my github site into a suitable direct
 Change to that directory and enter "make". This will make the program hl2_wifi_buffer. To run the program,
 enter "./hl2_wifi_buffer".
 ```
-clone git://github.com/jimahlstrom/hl2_wifi_buffer
-cd hl2_wifi_buffer
+git clone https://github.com/jimahlstrom/HL2WifiBuffer
+cd HL2WifiBuffer
 make
 ./hl2_wifi_buffer
 ```
@@ -134,6 +134,9 @@ The "WiFi buffer utilization" is the percentage of the buffer used, and should b
 
 You can set the buffer_milliseconds to zero in hl2_wifi_buffer.txt, and the Tx buffer will not be used.
 The software will simply copy the WiFi port to/from the HL2. This can be useful as a test.
+
+To run the adapter each time the SBC starts, create a systemd service file for it and control it with systemctl.
+If you change the configuration, restart the service.
 
 ## Use with Two Ethernet Interfaces
 
