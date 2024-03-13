@@ -10,6 +10,6 @@
 #wifi_interface = wlan0
 
 # This is the delay in milliseconds in the Tx samples buffer.
-# The delay can be 20 to 1000 milliseconds. The default is 300.
+# The delay can be 20 to 4000 milliseconds. The default is 300.
 # If the delay is zero, the buffer is not used and packets are just copied.
 #buffer_milliseconds = 250

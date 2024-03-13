@@ -1,6 +1,6 @@
 # A WiFi Adapter for the Hermes Lite 2
 ## by James Ahlstrom, N2ADR
-**February 22, 2024**
+**March 13, 2024**
 
 ## The Hermes Lite 2
 The [Hermes Lite2](http://www.hermeslite.com) is a low-cost direct sampling software defined amateur radio HF transceiver.
@@ -46,8 +46,8 @@ WiFi speed is even more troubling. There are the manufacturers' highly optimisti
 but can vary widely. And then there is the real world measurement at your location. Remember that WiFi is a radio link. The speed depends on the
 signal strength, the quality of the antenna and the amount of interference from other WiFi and Bluetooth devices, cordless phones and microwave heaters.
 You can measure your WiFi speed with the "iperf3" program.
-The small PCB antennas in the SBC are not very efficient, and it may be better to use an external USB WiFi adapter instead.
 
+The small PCB antennas in the SBC are not very efficient, and it may be better to use an external USB WiFi adapter instead.
 Be careful purchasing WiFi adapters. Some work with Linux and some will work if you install a special driver. Search the Internet for recommendations.
 Start with [this paper](https://github.com/morrownr/USB-WiFi/blob/main/home/USB_WiFi_Adapters_that_are_supported_with_Linux_in-kernel_drivers.md)
 and [this paper](https://github.com/morrownr/USB-WiFi/blob/main/home/USB_WiFi_Adapter_out-of-kernel_drivers_for_Linux.md).
@@ -130,7 +130,12 @@ Samples will be directed to the SBC, and it will appear that the SBC is the HL2.
 
 The "HL2 internal buffer faults" measures underflows and overflows in the HL2 Tx buffer.
 The "Jitter" is the maximum time between received WiFi UDP packets.
-The "WiFi buffer utilization" is the percentage of the buffer used, and should be close to 50%.
+The "WiFi buffer utilization" is the percentage of the buffer used, and should be close to 100%. If it reaches 0%
+it is an underflow. If it reaches 200% it is an overflow, and the buffer is reset.
+
+The WiFi sequence errors measure missing and out-of-order transmit packets. Any packet with a sequence number unequal to the last
+number plus one is "out-of-order". Missing and duplicated packets are recorded. If a packet is
+received after a more recent packet is sent to the HL2, it is "lost".
 
 You can set the buffer_milliseconds to zero in hl2_wifi_buffer.txt, and the Tx buffer will not be used.
 The software will simply copy the WiFi port to/from the HL2. This can be useful as a test.
