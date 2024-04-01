@@ -1,6 +1,6 @@
 # A WiFi Adapter for the Hermes Lite 2
 ## by James Ahlstrom, N2ADR
-**March 13, 2024**
+**Version 1.2 - March 31, 2024**
 
 ## The Hermes Lite 2
 The [Hermes Lite2](http://www.hermeslite.com) is a low-cost direct sampling software defined amateur radio HF transceiver.
@@ -131,11 +131,12 @@ Samples will be directed to the SBC, and it will appear that the SBC is the HL2.
 The "HL2 internal buffer faults" measures underflows and overflows in the HL2 Tx buffer.
 The "Jitter" is the maximum time between received WiFi UDP packets.
 The "WiFi buffer utilization" is the percentage of the buffer used, and should be close to 100%. If it reaches 0%
-it is an underflow. If it reaches 200% it is an overflow, and the buffer is reset.
+it is an underflow. If it reaches 120% it is an overflow, and the buffer is reset.
 
-The WiFi sequence errors measure missing and out-of-order transmit packets. Any packet with a sequence number unequal to the last
-number plus one is "out-of-order". Missing and duplicated packets are recorded. If a packet is
-received after a more recent packet is sent to the HL2, it is "lost".
+The WiFi sequence errors measure missing and out-of-order transmit packets. Out-of-order means that
+a packet with a lower than current sequence number was received.
+The software will re-order packets that are out of order.
+Missing and duplicated packets are recorded.
 
 You can set the buffer_milliseconds to zero in hl2_wifi_buffer.txt, and the Tx buffer will not be used.
 The software will simply copy the WiFi port to/from the HL2. This can be useful as a test.

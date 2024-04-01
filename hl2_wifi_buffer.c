@@ -21,7 +21,7 @@
 #include <ifaddrs.h>
 #include <stdlib.h>
 
-#define DEBUG	3
+#define DEBUG	0
 
 #define HTML_PORT	8080
 #define BUFFER_SIZE	2048
@@ -47,27 +47,42 @@ static struct in_addr hl2_hostaddr;
 static struct in_addr wifi_hostaddr;
 static double wifi_up_rate, wifi_down_rate;
 static double wifi_jitter=0;
+static double HL2_jitter=0;
 static unsigned int wifi_up_bytes, wifi_down_bytes;
 static uint8_t num_receivers = 1;
 static int sample_rate = 48000;
 static int mox = 0;
 static int txbuf_read = 0;
 static int txbuf_write = 0;
-static int txbuf_started = 0;
+static int txbuf_send_rqst = -1;
 static int txbuf_used;
 static unsigned int hl2_rx_samples = 0;
 static unsigned int hl2_buffer_faults = 0;
-static unsigned int wifi_buffer_faults = 0;
+static unsigned int wifi_buffer_overflow = 0;
+static unsigned int wifi_buffer_underflow = 0;
 static uint16_t wifi_seq_duplicate;
 static uint16_t wifi_seq_out_of_order;
 static uint16_t wifi_seq_missing;
-static uint16_t wifi_seq_too_late;
 static char wifi_iface[NAME_SIZE + 4], hl2_iface[NAME_SIZE + 4];
+static pthread_mutex_t HL2_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+enum {
+	STARTUP,
+	NORMAL,
+	RESTARTING
+} txbuf_started;
+
+enum _txbuf_state{
+	EMPTY,
+	FILLED,
+	ZEROED,
+	FILLED_RQST
+} ;
+
 static struct s_txbuf {
-	uint8_t filled;
+	enum _txbuf_state txbuf_state;
 	uint8_t buf[TX_BUF_BYTES];
 } TxBuf[TX_BUF_COUNT];
-static pthread_mutex_t HL2_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static double QuiskTimeSec(void)
 {
@@ -94,13 +109,46 @@ static inline uint16_t txbuf_fill(uint16_t uMin, uint16_t uMax)
 // Return the number of records in the buffer.
 // Records start at index uMin and continue to index uMax - 1.
 {
-	uint16_t fill;
-
 	if (uMax >= uMin)
-		fill = uMax - uMin;
+		return uMax - uMin;
 	else
-		fill = TX_BUF_COUNT - uMin + uMax;
-	return fill;
+		return TX_BUF_COUNT - uMin + uMax;
+}
+
+static void read_C0(uint8_t buffer[])
+{
+	uint8_t C0_addr, speed;
+
+	mox = buffer[11] & 0x01;
+	C0_addr = (buffer[11] >> 1) & 0x3F;
+	if (C0_addr == 0) {
+		speed = buffer[12] & 0x03;
+		num_receivers = ((buffer[15] >> 3) & 0x0F) + 1;
+	}
+	else {
+		C0_addr = (buffer[523] >> 1) & 0x3F;
+		if (C0_addr == 0) {
+			speed = buffer[524] & 0x03;
+			num_receivers = ((buffer[527] >> 3) & 0x0F) + 1;
+		}
+	}
+	if (C0_addr == 0) {
+		switch (speed) {
+		case 0:
+		default:
+			sample_rate = 48000;
+			break;
+		case 1:
+			sample_rate = 96000;
+			break;
+		case 2:
+			sample_rate = 192000;
+			break;
+		case 3:
+			sample_rate = 384000;
+			break;
+		}
+	}
 }
 
 static void * read_wifi_1024(void * arg)
@@ -111,82 +159,48 @@ static void * read_wifi_1024(void * arg)
 	int i, j, recv_len;
 	uint16_t index, above, below;
 	bool send_rqst;
-	uint8_t C0_addr, speed;
-	static double jitter;
+	double dtime, delta;
 	static double time_jitter = 0;
-	static double time_rates = 0;
-	double dtime;
+	static double debug_jitter = 0;
+	static double debug_print = 0;
+	float util;
 	uint8_t C0bufA[5], C0bufB[5];
-static uint8_t bufA[TX_BUF_BYTES], bufB[TX_BUF_BYTES];
-static uint8_t state = 0;
 
 	while (1) {
 		// Read port 1024 from WiFi.
 		sa_size = sizeof(struct sockaddr_in);
-		//recv_len = recvfrom(sock_wifi_1024, buffer, TX_BUF_BYTES, 0, (struct sockaddr *)&addr, &sa_size);
-
-state++;
-if (false && txbuf_started) {
-	if (state == 17) {
 		recv_len = recvfrom(sock_wifi_1024, buffer, TX_BUF_BYTES, 0, (struct sockaddr *)&addr, &sa_size);
-		memcpy(bufA, buffer, TX_BUF_BYTES);
-		//continue;
-	}
-	else if (state == 21) {
-	}
-	else if(false && state == 22) {
-		recv_len = 1032;
-		memcpy(buffer, bufA, TX_BUF_BYTES);
-	}
-	else {
-		recv_len = recvfrom(sock_wifi_1024, buffer, TX_BUF_BYTES, 0, (struct sockaddr *)&addr, &sa_size);
-	}
-}
-else {
-	recv_len = recvfrom(sock_wifi_1024, buffer, TX_BUF_BYTES, 0, (struct sockaddr *)&addr, &sa_size);
-}
 		if (recv_len <= 0) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				//printf ("Read WiFi timeout\n");
-				wifi_up_rate = wifi_down_rate = 0;
-				wifi_up_bytes = wifi_down_bytes = 0;
-				time_rates = time_jitter = QuiskTimeSec();
-				wifi_jitter = jitter = 0;
-			}
-			else {
-				perror("Read WiFi");
-			}
+			perror("Read WiFi");
 			continue;
 		}
 		if (hl2_hostaddr.s_addr == 0 ||  addr.sin_addr.s_addr == hl2_hostaddr.s_addr)	// reject packet
 			continue;
-		wifi_up_bytes += recv_len + 14 + 20 + 8;	// add headers
+		wifi_up_bytes += recv_len + 14 + 20 + 8;	// add header bytes to data bytes
 		dtime = QuiskTimeSec();
 		if (time_jitter == 0) {
 			time_jitter = dtime;
-			jitter = 0;
+			wifi_jitter = debug_jitter = 0;
 		}
-		else {		// no lock
-			if (dtime - time_jitter > jitter)
-				jitter = dtime - time_jitter;
+		else {
+			delta = dtime - time_jitter;
+			if (wifi_jitter < delta)
+				wifi_jitter = delta;
+			if (debug_jitter < delta)
+				debug_jitter = delta;
 			time_jitter = dtime;
 		}
-		if (time_rates == 0) {
-			time_rates = dtime;
-		}
-		else if (dtime - time_rates > 4.0) {		// no lock
-			wifi_up_rate = wifi_up_bytes * 8.0 / (dtime - time_rates) / 1E6;
-			wifi_down_rate = wifi_down_bytes * 8.0 / (dtime - time_rates) / 1E6;
-			time_rates = dtime;
-			wifi_up_bytes = wifi_down_bytes = 0;
-			wifi_jitter = jitter;
-			jitter = 0;
-			if (DEBUG >= 3) {
-				if (txbuf_used)
-					printf ("Buffer fill %5.1f%% Jitter %.3lf\n", (float)txbuf_fill(txbuf_read, txbuf_write) / txbuf_used * 100.0, wifi_jitter);
-				else
-					printf ("Jitter %.3lf\n", wifi_jitter);
-			}
+		if (DEBUG && dtime - debug_print >= 5) {
+			debug_print = dtime;
+			if (txbuf_used)
+				util = (float)txbuf_fill(txbuf_read, txbuf_write) / txbuf_used * 100.0;
+			else
+				util = 0;
+			printf("WiFi Buffer %3.0f%%, Jitter msec %3.0lf, Underflow %d, Overflow %d, Bad order %d , Missing %d, Dupl %d; HL2 Jitter %3.0lf, Buf faults %d\n",
+			util, debug_jitter * 1E3, wifi_buffer_underflow, wifi_buffer_overflow,
+			wifi_seq_out_of_order, wifi_seq_missing, wifi_seq_duplicate, HL2_jitter * 1E3, hl2_buffer_faults);
+			debug_jitter = 0;
+			HL2_jitter = 0;
 		}
 		if (recv_len != 1032 && DEBUG > 1) {
 			printf("WiFi1024 got %4d from %s port %d: ", recv_len, inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
@@ -200,7 +214,6 @@ else {
 			addr.sin_family = AF_INET;
 			addr.sin_port = htons(1024);
 			inet_aton("169.254.255.255", &addr.sin_addr);
-			HL2_sequence = 0;
 			if (sendto(sock_hl2, buffer, recv_len, 0, (struct sockaddr *)&addr, sizeof(struct sockaddr_in)) != recv_len)
 				perror("Forward discover packet");
 			continue;
@@ -209,20 +222,19 @@ else {
 			pthread_mutex_lock(&HL2_mutex);
 			num_receivers = 1;
 			time_jitter = 0;
-			time_rates = 0;
 			sample_rate = 48000;
-			txbuf_started = 0;
+			txbuf_started = STARTUP;
 			txbuf_read = 0;
 			txbuf_write = 0;
-			wifi_seq_duplicate = wifi_seq_out_of_order = wifi_seq_missing = wifi_seq_too_late = 0;
+			wifi_seq_duplicate = wifi_seq_out_of_order = wifi_seq_missing = 0;
 			for (i = 0; i < TX_BUF_COUNT; i++)
-				TxBuf[i].filled = 0;
+				TxBuf[i].txbuf_state = EMPTY;
 			mox = 0;
 			hl2_buffer_faults = 0;
-			wifi_buffer_faults = 0;
+			wifi_buffer_overflow = wifi_buffer_underflow = 0;
 			wifi_up_bytes = wifi_down_bytes = 0;
-			pthread_mutex_unlock(&HL2_mutex);
 			HL2_sequence = 0;
+			pthread_mutex_unlock(&HL2_mutex);
 			if (sockaddr_in_hl2_1024.sin_addr.s_addr != 0)
 				if (sendto(sock_hl2, buffer, recv_len, 0, (struct sockaddr *)&sockaddr_in_hl2_1024, sizeof(struct sockaddr_in)) != recv_len)
 					perror("Forward Start/Stop to HL2");
@@ -235,39 +247,9 @@ else {
 			continue;
 		}
 		// This is the I/Q transmit samples from WiFi on endpoint 2.
-		// The recv_len is 1032. Decode some needed data.
-		C0_addr = (buffer[11] >> 1) & 0x3F;
-		if (C0_addr == 0) {
-			speed = buffer[12] & 0x03;
-			num_receivers = ((buffer[15] >> 3) & 0x0F) + 1;
-		}
-		else {
-			C0_addr = (buffer[523] >> 1) & 0x3F;
-			if (C0_addr == 0) {
-				speed = buffer[524] & 0x03;
-				num_receivers = ((buffer[527] >> 3) & 0x0F) + 1;
-			}
-		}
-		if (C0_addr == 0) {
-			switch (speed) {
-			case 0:
-			default:
-				sample_rate = 48000;
-				break;
-			case 1:
-				sample_rate = 96000;
-				break;
-			case 2:
-				sample_rate = 192000;
-				break;
-			case 3:
-				sample_rate = 384000;
-				break;
-			}
-			//printf("%d %d\n", num_receivers, sample_rate);
-		}
+		// The recv_len is 1032.
 		if (txbuf_used == 0) {		// Tx buffer is not in use - just copy packet
-			mox = buffer[11] & 0x01;
+			read_C0(buffer);
 			replace_hl2_sequence(buffer);
 			if (sockaddr_in_hl2_1024.sin_addr.s_addr != 0)
 				if (sendto(sock_hl2, buffer, recv_len, 0, (struct sockaddr *)&sockaddr_in_hl2_1024, sizeof(struct sockaddr_in)) != recv_len)
@@ -287,105 +269,59 @@ else {
 				txbuf_write = 0;
 		}
 		else {
-			wifi_seq_out_of_order++;
 			above = txbuf_fill(txbuf_write, index);
 			below = txbuf_fill(index, txbuf_write);
 			if (above < below) {	// index is above txbuf_write
-				if (DEBUG)
+				if (DEBUG > 1)
 					printf("index above %d %d %d\n", above, txbuf_write, index);
 				txbuf_write = index;
 				if (++txbuf_write >= TX_BUF_COUNT) 
 					txbuf_write = 0;
 			}
 			else {		// index is below txbuf_write
-				if (DEBUG)
+				wifi_seq_out_of_order++;
+				if (DEBUG > 1)
 					printf("index below %d %d %d\n", below, txbuf_write, index);
 				above = txbuf_fill(txbuf_read, index);
 				below = txbuf_fill(index, txbuf_read);
-				if (below < above) {	// index is below txbuf_read
-					if (txbuf_started) {
-						if (DEBUG)
-							printf ("Late index %d\n", below);
-						wifi_seq_too_late++;
-					}
-					else {
-						txbuf_read = index;
-					}
+				if (below < above) {	// index is below txbuf_read - discard
+					pthread_mutex_unlock(&HL2_mutex);
+					continue;
 				}
 			}
 		}
-		if (TxBuf[index].filled) {
-			if (DEBUG)
+		// copy the received packet in buffer to TxBuf[index]
+		if (TxBuf[index].txbuf_state == FILLED || TxBuf[index].txbuf_state == FILLED_RQST) {
+			if (DEBUG > 1)
 				printf("TxBuf collision at %d\n", index);
 			wifi_seq_duplicate++;
 		}
 		memcpy(TxBuf[index].buf, buffer, TX_BUF_BYTES);
-		TxBuf[index].filled = 1;
-		if (txbuf_fill(txbuf_read, txbuf_write) > txbuf_used * 2) {
-			wifi_buffer_faults++;
-			if (DEBUG)
-				printf("WiFi TxBuf overflow\n");
-			txbuf_read = txbuf_write - txbuf_used;
-			if (txbuf_read < 0)
-				txbuf_read += TX_BUF_COUNT;
-		}
 		if (buffer[11] & 0x80 || buffer[523] & 0x80) {	// The RQST bit is set
-			send_rqst = true;	// copy C0-C4 to the next-to-send packet and then send it
-			memcpy(C0bufA, &TxBuf[txbuf_read].buf[ 11], 5);
-			memcpy(C0bufB, &TxBuf[txbuf_read].buf[523], 5);
-			memcpy(&TxBuf[txbuf_read].buf[ 11], &TxBuf[index].buf[ 11], 5);
-			memcpy(&TxBuf[txbuf_read].buf[523], &TxBuf[index].buf[523], 5);
-			memcpy(&TxBuf[index].buf[ 11], C0bufA, 5);
-			memcpy(&TxBuf[index].buf[523], C0bufB, 5);
-			index = txbuf_read;	// send the packet at index
-			if (++txbuf_read >= TX_BUF_COUNT) 
-				txbuf_read = 0;
-			hl2_rx_samples -= (504 / (num_receivers * 6 + 2)) * 2;	// total samples for each receiver from HL2
+			txbuf_send_rqst = index;
+			TxBuf[index].txbuf_state = FILLED_RQST;
 		}
 		else {
-			send_rqst = false;
+			TxBuf[index].txbuf_state = FILLED;
 		}
 		pthread_mutex_unlock(&HL2_mutex);
-		if (send_rqst && sockaddr_in_hl2_1024.sin_addr.s_addr != 0) {
-			if (TxBuf[index].filled) {
-				TxBuf[index].filled = 0;
-				// copy the prevailing mox bit to this out-of-order packet at index
-				if (mox) {
-					TxBuf[index].buf[ 11] |= 0x01;
-					TxBuf[index].buf[523] |= 0x01;
-				}
-				else {
-					TxBuf[index].buf[ 11] &= 0xFE;
-					TxBuf[index].buf[523] &= 0xFE;
-				}
-				replace_hl2_sequence(TxBuf[index].buf);
-				if (sendto(sock_hl2, TxBuf[index].buf, 1032, 0,
-						(struct sockaddr *)&sockaddr_in_hl2_1024, sizeof(struct sockaddr_in)) != recv_len)
-					perror("Forward RQST to HL2");
-				uint8_t * pt = TxBuf[index].buf + 523;
-				if (DEBUG)
-					printf("Send RQST 0x%X, 0x%X, 0x%X, 0x%X, 0x%X \n", *pt++ >> 1, *pt++, *pt++, *pt++, *pt);
-			}
-			else {
-				if (DEBUG)
-					printf("Trying to send empty packet at %d", index);
-				wifi_seq_missing++;
-			}
-		}
 	}
 	return NULL;
 }
 
 static void * read_hl2(void * arg)
 {  // Data from the HL2 that is copied to WiFi
-	unsigned char buffer[BUFFER_SIZE];
-	static uint8_t tx_buffer[TX_BUF_BYTES];
+	uint8_t buffer[BUFFER_SIZE];
+	uint8_t * ptBuf;
+	static int txbuf_last_good = 0;
 	struct sockaddr_in addr;
 	socklen_t sa_size;
-	int recv_len, ratio, tx_len;
+	int i, recv_len, ratio;
 	uint8_t hl2_tx_fifo = 0;
 	static uint8_t hl2_tx_state = 0;
 	uint8_t C0_addr;
+	static double txbuf_time = 0;
+	double dtime;
 
 	while (1) {
 		buffer[0] = 0;
@@ -439,11 +375,11 @@ static void * read_hl2(void * arg)
 						hl2_tx_state = 0;
 						//printf ("       mox %d, state %d, fifo 0x%X\n", mox, hl2_tx_state, hl2_tx_fifo);
 					}
-					else if (hl2_tx_fifo == 0x80 || hl2_tx_fifo == 0xFF) {	// check the error bit
+					else if (hl2_tx_fifo & 0x80) {
 						hl2_buffer_faults++;
 						hl2_tx_state = 3;
-						if (DEBUG)
-							printf ("HL2 buffer fault: mox %d, state %d, fifo 0x%X\n", mox, hl2_tx_state, hl2_tx_fifo);
+						if (DEBUG > 1)
+							printf ("HL2 buffer fault: fifo 0x%X\n", hl2_tx_fifo);
 					}
 					break;
 				case 3:			// the error bit was set; wait for it to clear
@@ -461,26 +397,49 @@ static void * read_hl2(void * arg)
 		}
 		if (ntohs(addr.sin_port) == 1025) {
 			sockaddr_in_hl2_1025 = addr;
-			wifi_down_bytes += recv_len + 14 + 20 + 8;	// add headers
+			wifi_down_bytes += recv_len + 14 + 20 + 8;	// add header bytes to data bytes
 			if (sendto(sock_wifi_1025, buffer, recv_len, 0, (struct sockaddr *)&sockaddr_in_client_1025, sizeof(struct sockaddr_in)) != recv_len)
 				perror("Forward 1025 from HL2");
 			continue;
 		}
 		sockaddr_in_hl2_1024 = addr;
-		wifi_down_bytes += recv_len + 14 + 20 + 8;	// add headers
+		wifi_down_bytes += recv_len + 14 + 20 + 8;	// add header bytes to data bytes
 		if (sendto(sock_wifi_1024, buffer, recv_len, 0, (struct sockaddr *)&sockaddr_in_client_1024, sizeof(struct sockaddr_in)) != recv_len)
 			perror("Forward 1024 from HL2");
 		if (txbuf_used == 0)
 			continue;
 		// Send TxBuf samples to the HL2
-		tx_len = 0;
+		ptBuf = NULL;
 		pthread_mutex_lock(&HL2_mutex);
-		if (txbuf_started == 0) {
+		if (txbuf_fill(txbuf_read, txbuf_write) > txbuf_used * 12 / 10) {	// check for overflow
+			int ignored = 0;
+			wifi_buffer_overflow++;
+			i = txbuf_read;
+			txbuf_read = txbuf_write - txbuf_used;
+			if (txbuf_read < 0)
+				txbuf_read += TX_BUF_COUNT;
+			while (i != txbuf_read) {	// change ignored records to EMPTY
+				TxBuf[i].txbuf_state = EMPTY;
+				ignored++;
+				if (++i >= TX_BUF_COUNT)
+					i = 0;
+			}
+			if (DEBUG)
+				printf("WiFi TxBuf overflow %d\n", ignored);
+		}
+		if (txbuf_started == STARTUP) {
 			hl2_rx_samples = 0;
+			txbuf_time = QuiskTimeSec();
+			if (txbuf_send_rqst >= 0) {
+				// copy the packet with the RQST bit to the HL2
+				memcpy(buffer, TxBuf[txbuf_send_rqst].buf, BUFFER_SIZE);
+				ptBuf = buffer;
+				txbuf_send_rqst = -1;
+			}
 			if (txbuf_fill(txbuf_read, txbuf_write) >= txbuf_used) {
-				txbuf_started = 1;
+				txbuf_started = NORMAL;
 				if (DEBUG)
-					printf ("txbuf Started\n");
+					printf ("WiFi TxBuf Started\n");
 			}
 		}
 		else {
@@ -488,37 +447,84 @@ static void * read_hl2(void * arg)
 				hl2_rx_samples += (504 / (num_receivers * 6 + 2)) * 2;	// total samples for each receiver from HL2
 				ratio = sample_rate / 48000;		// send rate is 48 ksps
 				if (hl2_rx_samples / ratio >= 63 * 2) {	// Send a UDP packet
-					if (TX_BUF_EMPTY) {
-						wifi_buffer_faults++;
+					hl2_rx_samples -= 63 * 2 * ratio;
+					ptBuf = &TxBuf[txbuf_last_good].buf[0];
+					if (TX_BUF_EMPTY && txbuf_started == NORMAL) {
+						wifi_buffer_underflow++;
 						if (DEBUG)
 							printf("WiFi TxBuf underflow\n");
-						txbuf_started = 0;
-						txbuf_read = 0;
-						txbuf_write = 0;
+						txbuf_started = RESTARTING;
 					}
-					else {
-						tx_len = 1032;
-						if (TxBuf[txbuf_read].filled) {	 // send the buffer packet at txbuf_read to the HL2
-							TxBuf[txbuf_read].filled = 0;
-							memcpy(tx_buffer, TxBuf[txbuf_read].buf, tx_len);
+					if (txbuf_started == RESTARTING) {		// send the last packet again with zeroed Tx samples
+						if (TxBuf[txbuf_last_good].txbuf_state != ZEROED) {
+							TxBuf[txbuf_last_good].txbuf_state = ZEROED;
+							memset(TxBuf[txbuf_last_good].buf +  16, 0, 504);
+							memset(TxBuf[txbuf_last_good].buf + 528, 0, 504);
 						}
-						else {		// send the last packet again
+						if (txbuf_fill(txbuf_read, txbuf_write) >= txbuf_used) {
+							txbuf_started = NORMAL;
 							if (DEBUG)
+								printf ("Wifi TxBuf underflow - restarting\n");
+						}
+					}
+					if (txbuf_started == NORMAL) {
+						if (TxBuf[txbuf_read].txbuf_state == FILLED_RQST) {
+							TxBuf[txbuf_read].txbuf_state = FILLED;
+							memcpy(&TxBuf[txbuf_read].buf[ 11], &TxBuf[txbuf_last_good].buf[ 11], 5);
+							memcpy(&TxBuf[txbuf_read].buf[523], &TxBuf[txbuf_last_good].buf[523], 5);
+						}
+						if (TxBuf[txbuf_read].txbuf_state == FILLED) {	 // send the buffer packet at txbuf_read to the HL2
+							TxBuf[txbuf_read].txbuf_state = EMPTY;
+							read_C0(TxBuf[txbuf_read].buf);
+							txbuf_last_good = txbuf_read;
+							ptBuf = &TxBuf[txbuf_last_good].buf[0];
+						}
+						else {		// send the last packet again with zeroed Tx samples
+							if (DEBUG > 1)
 								printf("Sending empty packet at %d\n", txbuf_read);
 							wifi_seq_missing++;
+							if (TxBuf[txbuf_last_good].txbuf_state != ZEROED) {
+								TxBuf[txbuf_last_good].txbuf_state = ZEROED;
+								memset(TxBuf[txbuf_last_good].buf +  16, 0, 504);
+								memset(TxBuf[txbuf_last_good].buf + 528, 0, 504);
+							}
 						}
 						if (++txbuf_read >= TX_BUF_COUNT)
 							txbuf_read = 0;
-						hl2_rx_samples -= 63 * 2 * ratio;
+					}
+					if (txbuf_send_rqst >= 0) {
+						// copy the packet we are sending to the HL2
+						memcpy(buffer, ptBuf, BUFFER_SIZE);
+						// copy C0-C4 to the packet
+						memcpy(buffer +  11, &TxBuf[txbuf_send_rqst].buf[ 11], 5);
+						memcpy(buffer + 523, &TxBuf[txbuf_send_rqst].buf[523], 5);
+						txbuf_send_rqst = -1;
+						// copy the prevailing mox bit to this out-of-order packet
+						if (mox) {
+							buffer[ 11] |= 0x01;
+							buffer[523] |= 0x01;
+						}
+						else {
+							buffer[ 11] &= 0xFE;
+							buffer[523] &= 0xFE;
+						}
+						ptBuf = buffer;
 					}
 				}
 			}
 		}
 		pthread_mutex_unlock(&HL2_mutex);
-		if (tx_len > 0) {
-			mox = tx_buffer[11] & 0x01;
-			replace_hl2_sequence(tx_buffer);
-			if (sendto(sock_hl2, tx_buffer, tx_len, 0,
+		if (ptBuf) {
+			if (DEBUG) {
+				double delta;
+				dtime = QuiskTimeSec();
+				delta = dtime - txbuf_time;
+				if (HL2_jitter < delta)
+					HL2_jitter = delta;
+				txbuf_time = dtime;
+			}
+			replace_hl2_sequence(ptBuf);
+			if (sendto(sock_hl2, ptBuf, recv_len, 0,
 					(struct sockaddr *)&sockaddr_in_hl2_1024, sizeof(struct sockaddr_in)) != recv_len)
 				perror("Forward TxBuf to HL2");
 		}
@@ -534,7 +540,6 @@ static void * webserver(void * arg)
 	double util;
 	static double time_rates = 0;
 	double dtime;
-	char toggle = 'S';
 	char buffer[BUFFER_SIZE];
 	char * resp1 = "HTTP/1.0 200 OK\r\n"
 "Server: webserver-c\r\n"
@@ -554,7 +559,7 @@ static void * webserver(void * arg)
 ;
 
 	char * resp2 =
-"<h4>Hermes-Lite2 Wifi Buffer v1.1</h4>\r\n"
+"<h4>Hermes-Lite2 Wifi Buffer v1.2</h4>\r\n"
 "<b>Hermes Lite</b>\r\n"
 "<br>\r\n"
 "HL2 Interface %s\r\n"
@@ -577,7 +582,7 @@ static void * webserver(void * arg)
 "<br>\r\n"
 "Rate down %.1lf Mbits/sec\r\n"
 "<br>\r\n"
-"Jitter %.3lf %ceconds\r\n"
+"Jitter msec %.0lf\r\n"
 "<br>\r\n"
 "<br>\r\n"
 ;
@@ -590,8 +595,6 @@ static void * webserver(void * arg)
 "Missing %u\r\n"
 "<br>\r\n"
 "Duplicate %u\r\n"
-"<br>\r\n"
-"Too late - lost %u\r\n"
 "<br>\r\n"
 "<br>\r\n"
 ;
@@ -611,7 +614,9 @@ static void * webserver(void * arg)
 "<br>\r\n"
 "Level %.1f%%\r\n"
 "<br>\r\n"
-"Faults %d\r\n"
+"Underflow %d\r\n"
+"<br>\r\n"
+"Overflow %d\r\n"
 "<br>\r\n"
 ;
 
@@ -658,18 +663,20 @@ static void * webserver(void * arg)
 		valwrite = write(sock_accept, buffer, strlen(buffer));
 		if (valwrite < 0)
 			perror("webserver (write)");
-		if (toggle == 'S')
-			toggle = 's';
-		else
-			toggle = 'S';
+		dtime = QuiskTimeSec();
+		wifi_up_rate = wifi_up_bytes * 8.0 / (dtime - time_rates) / 1E6;	// no lock
+		wifi_down_rate = wifi_down_bytes * 8.0 / (dtime - time_rates) / 1E6;
+		time_rates = dtime;
+		wifi_up_bytes = wifi_down_bytes = 0;
 		snprintf(buffer, BUFFER_SIZE, resp3,
 			wifi_iface, inet_ntoa(wifi_hostaddr),
-			wifi_up_rate, wifi_down_rate, wifi_jitter, toggle);
+			wifi_up_rate, wifi_down_rate, wifi_jitter * 1E3);
+		wifi_jitter = 0;
 		valwrite = write(sock_accept, buffer, strlen(buffer));
 		if (valwrite < 0)
 			perror("webserver (write)");
 		if (txbuf_used) {
-			snprintf(buffer, BUFFER_SIZE, resp4a, wifi_seq_out_of_order, wifi_seq_missing, wifi_seq_duplicate, wifi_seq_too_late);
+			snprintf(buffer, BUFFER_SIZE, resp4a, wifi_seq_out_of_order, wifi_seq_missing, wifi_seq_duplicate);
 			valwrite = write(sock_accept, buffer, strlen(buffer));
 			if (valwrite < 0)
 				perror("webserver (write)");
@@ -679,7 +686,7 @@ static void * webserver(void * arg)
 			if (valwrite < 0)
 				perror("webserver (write)");
 		}
-		snprintf(buffer, BUFFER_SIZE, resp5, delay, util, wifi_buffer_faults);
+		snprintf(buffer, BUFFER_SIZE, resp5, delay, util, wifi_buffer_underflow, wifi_buffer_overflow);
 		valwrite = write(sock_accept, buffer, strlen(buffer));
 		if (valwrite < 0)
 			perror("webserver (write)");
@@ -818,8 +825,8 @@ int main()
 	setsockopt(sock_wifi_1025, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(int));
 	if (setsockopt(sock_wifi_1024, SOL_SOCKET, SO_BROADCAST, (char*)&one, sizeof(one)) != 0)
 		perror("setsockopt broadcast for sock_wifi_1024 failed");
-	if (setsockopt(sock_wifi_1024, SOL_SOCKET, SO_RCVTIMEO, (char*)&rtimeout, sizeof(rtimeout)) != 0)
-		perror("setsockopt timeout for sock_wifi_1024 failed");
+	//if (setsockopt(sock_wifi_1024, SOL_SOCKET, SO_RCVTIMEO, (char*)&rtimeout, sizeof(rtimeout)) != 0)
+	//	perror("setsockopt timeout for sock_wifi_1024 failed");
 	if (setsockopt(sock_wifi_1025, SOL_SOCKET, SO_BROADCAST, (char*)&one, sizeof(one)) != 0)
 		perror("setsockopt broadcast for sock_wifi_1025 failed");
 	memset(&addr, 0, sizeof(addr));
